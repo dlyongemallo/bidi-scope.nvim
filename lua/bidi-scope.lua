@@ -9,6 +9,7 @@ M.config = {
   suppress_identical = false,  -- Hide hint if visual order matches logical order.
   fix_iskeyword = true,        -- Add RTL character ranges to iskeyword (may be overridden by movement plugins).
   native_motions = true,       -- Use native word motions in buffers with RTL content (for nvim-spider compat).
+  zwnj_workaround = false,     -- Replace ZWNJ with dotted circle (workaround for kitty).
 }
 
 -- Namespace for extmarks.
@@ -23,8 +24,12 @@ local hint_cache = {
   extmark_id = nil,
 }
 
+-- ZWNJ character (U+200C) in UTF-8.
+local ZWNJ = vim.fn.nr2char(0x200C)
+-- Dotted circle (U+25CC) - visible marker for ZWNJ position.
+local DOTTED_CIRCLE = vim.fn.nr2char(0x25CC)
+
 --- Reverse word order for visual display.
---- Terminal handles letter-level RTL, we just need to fix word order.
 local function reverse_words(text)
   local words = {}
   for word in text:gmatch('%S+') do
@@ -33,35 +38,60 @@ local function reverse_words(text)
   return table.concat(words, ' ')
 end
 
+--- Convert text to visual order for hint display.
+local function to_visual_order(text)
+  return reverse_words(text)
+end
+
 --- Get the Unicode codepoint of a UTF-8 character.
---- TODO: Lua 5.1/LuaJIT lacks the utf8 library. Replace the following with utf8 library calls when it becomes available.
+--- Returns nil for invalid or empty input.
+--- TODO: Lua 5.1/LuaJIT lacks the utf8 library. Replace with utf8.codepoint() when available.
 local function utf8_codepoint(char)
+  if not char or #char == 0 then
+    return nil
+  end
   local byte = char:byte(1)
   if byte < 0x80 then
     return byte
   elseif byte < 0xE0 then
-    return ((byte - 0xC0) * 64) + (char:byte(2) - 0x80)
+    local b2 = char:byte(2)
+    if not b2 then return nil end
+    return ((byte - 0xC0) * 64) + (b2 - 0x80)
   elseif byte < 0xF0 then
-    return ((byte - 0xE0) * 4096) + ((char:byte(2) - 0x80) * 64) + (char:byte(3) - 0x80)
-  else
-    return ((byte - 0xF0) * 262144) + ((char:byte(2) - 0x80) * 4096) +
-           ((char:byte(3) - 0x80) * 64) + (char:byte(4) - 0x80)
+    local b2, b3 = char:byte(2), char:byte(3)
+    if not b2 or not b3 then return nil end
+    return ((byte - 0xE0) * 4096) + ((b2 - 0x80) * 64) + (b3 - 0x80)
+  elseif byte < 0xF8 then
+    local b2, b3, b4 = char:byte(2), char:byte(3), char:byte(4)
+    if not b2 or not b3 or not b4 then return nil end
+    return ((byte - 0xF0) * 262144) + ((b2 - 0x80) * 4096) +
+           ((b3 - 0x80) * 64) + (b4 - 0x80)
   end
+  return nil  -- Invalid leading byte (0xF8-0xFF).
 end
 
 --- Split a UTF-8 string into characters with their byte positions.
+--- Handles invalid sequences by treating each invalid byte as a single character.
 local function utf8_chars(str)
   local chars = {}
   local i = 1
-  while i <= #str do
+  local len = #str
+  while i <= len do
     local byte = str:byte(i)
     local char_len = 1
-    if byte >= 0xF0 then
+    if byte >= 0xF0 and byte < 0xF8 then
       char_len = 4
     elseif byte >= 0xE0 then
       char_len = 3
-    elseif byte >= 0xC0 then
+    elseif byte >= 0xC2 then  -- 0xC0-0xC1 are invalid (overlong encodings).
       char_len = 2
+    elseif byte >= 0x80 then
+      -- Continuation byte or invalid; treat as single byte.
+      char_len = 1
+    end
+    -- Clamp to string length.
+    if i + char_len - 1 > len then
+      char_len = len - i + 1
     end
     table.insert(chars, {
       char = str:sub(i, i + char_len - 1),
@@ -73,14 +103,42 @@ local function utf8_chars(str)
   return chars
 end
 
---- Check if a codepoint is RTL (Hebrew, Arabic, etc.).
+--- Check if a codepoint is RTL (Bidi_Class R or AL).
+--- Based on Unicode DerivedBidiClass.txt.
 local function is_rtl(cp)
-  return (cp >= 0x0590 and cp <= 0x05FF) or   -- Hebrew
-         (cp >= 0x0600 and cp <= 0x06FF) or   -- Arabic
-         (cp >= 0x0750 and cp <= 0x077F) or   -- Arabic Supplement
-         (cp >= 0x08A0 and cp <= 0x08FF) or   -- Arabic Extended-A
-         (cp >= 0xFB50 and cp <= 0xFDFF) or   -- Arabic Presentation Forms-A
-         (cp >= 0xFE70 and cp <= 0xFEFF)      -- Arabic Presentation Forms-B
+  if not cp then return false end
+  -- Basic Multilingual Plane (BMP) RTL scripts.
+  if (cp >= 0x0590 and cp <= 0x05FF) or   -- Hebrew
+     (cp >= 0x0600 and cp <= 0x06FF) or   -- Arabic
+     (cp >= 0x0700 and cp <= 0x074F) or   -- Syriac
+     (cp >= 0x0750 and cp <= 0x077F) or   -- Arabic Supplement
+     (cp >= 0x0780 and cp <= 0x07BF) or   -- Thaana
+     (cp >= 0x07C0 and cp <= 0x07FF) or   -- N'Ko
+     (cp >= 0x0800 and cp <= 0x083F) or   -- Samaritan
+     (cp >= 0x0840 and cp <= 0x085F) or   -- Mandaic
+     (cp >= 0x0860 and cp <= 0x086F) or   -- Syriac Supplement
+     (cp >= 0x0870 and cp <= 0x089F) or   -- Arabic Extended-B
+     (cp >= 0x08A0 and cp <= 0x08FF) or   -- Arabic Extended-A
+     cp == 0x200F or                       -- Right-to-Left Mark
+     (cp >= 0xFB1D and cp <= 0xFB4F) or   -- Hebrew Presentation Forms
+     (cp >= 0xFB50 and cp <= 0xFDFF) or   -- Arabic Presentation Forms-A
+     (cp >= 0xFE70 and cp <= 0xFEFF) then  -- Arabic Presentation Forms-B
+    return true
+  end
+  -- Supplementary Multilingual Plane (SMP) RTL scripts.
+  if cp >= 0x10000 then
+    return (cp >= 0x10800 and cp <= 0x10CFF) or  -- Cypriot through Old Hungarian
+           (cp >= 0x10D00 and cp <= 0x10D3F) or  -- Hanifi Rohingya
+           (cp >= 0x10E60 and cp <= 0x10EBF) or  -- Rumi, Yezidi
+           (cp >= 0x10EC0 and cp <= 0x10EFF) or  -- Arabic Extended-C
+           (cp >= 0x10F00 and cp <= 0x10FFF) or  -- Old Sogdian through Elymaic
+           (cp >= 0x1E800 and cp <= 0x1E8DF) or  -- Mende Kikakui
+           (cp >= 0x1E900 and cp <= 0x1E95F) or  -- Adlam
+           (cp >= 0x1EC70 and cp <= 0x1ECBF) or  -- Indic Siyaq Numbers
+           (cp >= 0x1ED00 and cp <= 0x1ED4F) or  -- Ottoman Siyaq Numbers
+           (cp >= 0x1EE00 and cp <= 0x1EEFF)     -- Arabic Mathematical Symbols
+  end
+  return false
 end
 
 --- Check if a buffer contains any RTL characters (first 100 lines only).
@@ -98,17 +156,67 @@ local function buffer_has_rtl(buf)
   return false
 end
 
---- Check if a codepoint is weak/neutral (numbers, punctuation, space).
+--- Check if a codepoint is weak/neutral (numbers, punctuation, space, formatting).
+--- These characters should not break RTL runs.
 local function is_weak(cp)
-  return (cp >= 0x0030 and cp <= 0x0039) or   -- 0-9
-         (cp >= 0x0660 and cp <= 0x0669) or   -- Arabic-Indic digits
-         (cp >= 0x06F0 and cp <= 0x06F9) or   -- Extended Arabic-Indic digits
-         cp == 0x0020 or                       -- Space
-         cp == 0x00A0 or                       -- Non-breaking space
-         (cp >= 0x0021 and cp <= 0x002F) or   -- Punctuation
-         (cp >= 0x003A and cp <= 0x0040) or   -- Punctuation
-         (cp >= 0x005B and cp <= 0x0060) or   -- Punctuation
-         (cp >= 0x007B and cp <= 0x007E)      -- Punctuation
+  if not cp then return false end
+  -- ASCII.
+  if cp == 0x0009 or                       -- Tab
+     cp == 0x0020 or                       -- Space
+     (cp >= 0x0021 and cp <= 0x002F) or   -- !"#$%&'()*+,-./
+     (cp >= 0x0030 and cp <= 0x0039) or   -- 0-9
+     (cp >= 0x003A and cp <= 0x0040) or   -- :;<=>?@
+     (cp >= 0x005B and cp <= 0x0060) or   -- [\]^_`
+     (cp >= 0x007B and cp <= 0x007E) then  -- {|}~
+    return true
+  end
+  -- Latin-1 Supplement punctuation and symbols.
+  if cp == 0x00A0 or                       -- Non-breaking space
+     (cp >= 0x00A1 and cp <= 0x00BF) then  -- Inverted punctuation, currency, etc.
+    return true
+  end
+  -- Hebrew punctuation (not letters).
+  if cp == 0x05BE or                       -- Maqaf (hyphen)
+     cp == 0x05C0 or                       -- Paseq
+     cp == 0x05C3 or                       -- Sof Pasuq
+     cp == 0x05C6 or                       -- Nun Hafukha
+     cp == 0x05F3 or                       -- Geresh
+     cp == 0x05F4 then                     -- Gershayim
+    return true
+  end
+  -- Arabic punctuation and numbers.
+  if cp == 0x060C or                       -- Arabic Comma
+     cp == 0x061B or                       -- Arabic Semicolon
+     cp == 0x061F or                       -- Arabic Question Mark
+     cp == 0x0640 or                       -- Tatweel
+     (cp >= 0x0660 and cp <= 0x0669) or   -- Arabic-Indic digits
+     (cp >= 0x06F0 and cp <= 0x06F9) then  -- Extended Arabic-Indic digits
+    return true
+  end
+  -- General Punctuation block.
+  if (cp >= 0x2000 and cp <= 0x200A) or   -- Various spaces
+     (cp >= 0x200B and cp <= 0x200F) or   -- Zero-width chars, LRM, RLM
+     (cp >= 0x2010 and cp <= 0x2027) or   -- Dashes, quotes, bullets
+     cp == 0x202F or                       -- Narrow no-break space
+     cp == 0x2039 or                       -- Single left angle quote
+     cp == 0x203A or                       -- Single right angle quote
+     cp == 0x2060 or                       -- Word Joiner
+     (cp >= 0x2066 and cp <= 0x2069) then  -- Bidi isolates
+    return true
+  end
+  -- Bidi control characters.
+  if cp >= 0x202A and cp <= 0x202E then   -- LRE, RLE, PDF, LRO, RLO
+    return true
+  end
+  -- Currency symbols.
+  if cp >= 0x20A0 and cp <= 0x20CF then
+    return true
+  end
+  -- Misc.
+  if cp == 0xFEFF then                     -- BOM / ZWNBSP
+    return true
+  end
+  return false
 end
 
 --- Find all RTL runs on a line.
@@ -191,73 +299,130 @@ local function cache_valid(buf, line_num, line_content)
   -- Note: cursor_col is checked separately in update_hint.
 end
 
---- Parse text into words with their byte positions.
-local function parse_words(text)
+--- Build a byte position mapping from original to visual order.
+--- Returns a table mapping original byte positions to visual byte positions.
+local function build_position_map(text)
+  -- Parse into characters with positions.
+  local chars = utf8_chars(text)
+  if #chars == 0 then
+    return {}
+  end
+
+  -- Group characters into words, tracking char indices.
   local words = {}
-  local pos = 1
-  for word in text:gmatch('%S+') do
-    local start = text:find(word, pos, true)
-    table.insert(words, {
-      word = word,
-      start = start,
-      stop = start + #word - 1,
-    })
-    pos = start + #word
-  end
-  return words
-end
+  local current_word = { chars = {}, start_char = nil }
 
---- Map cursor position from logical to visual order.
---- Returns the character offset in the visual text, or nil if cursor not in run.
-local function map_cursor_to_visual(run_text, cursor_offset)
-  if cursor_offset < 1 or cursor_offset > #run_text then
-    return nil
-  end
-
-  local words = parse_words(run_text)
-  if #words == 0 then
-    return nil
-  end
-
-  -- Find which word the cursor is in.
-  local cursor_word_idx = nil
-  local offset_in_word = nil
-
-  for i, w in ipairs(words) do
-    if cursor_offset >= w.start and cursor_offset <= w.stop then
-      cursor_word_idx = i
-      offset_in_word = cursor_offset - w.start
-      break
-    elseif cursor_offset < w.start then
-      -- Cursor is in whitespace before this word - treat as end of previous word.
-      if i > 1 then
-        cursor_word_idx = i - 1
-        offset_in_word = #words[i - 1].word
-      else
-        cursor_word_idx = 1
-        offset_in_word = 0
+  for i, c in ipairs(chars) do
+    local is_space = c.char:match('^%s+$')
+    if is_space then
+      if #current_word.chars > 0 then
+        table.insert(words, current_word)
+        current_word = { chars = {}, start_char = nil }
       end
-      break
+      -- Space characters go into their own "word" to preserve them.
+      table.insert(words, { chars = { { char = c.char, orig_idx = i } }, is_space = true })
+    else
+      if current_word.start_char == nil then
+        current_word.start_char = i
+      end
+      table.insert(current_word.chars, { char = c.char, orig_idx = i })
+    end
+  end
+  if #current_word.chars > 0 then
+    table.insert(words, current_word)
+  end
+
+  -- Separate words and spaces, then reverse only the words.
+  local word_list = {}
+  local space_list = {}
+
+  for _, w in ipairs(words) do
+    if w.is_space then
+      table.insert(space_list, w.chars[1])  -- Store the space char with orig_idx.
+    else
+      table.insert(word_list, w)
     end
   end
 
-  -- If cursor is after all words, it's at the end of the last word.
-  if not cursor_word_idx then
-    cursor_word_idx = #words
-    offset_in_word = #words[#words].word
+  -- Reverse word order.
+  local reversed_words = {}
+  for i = #word_list, 1, -1 do
+    table.insert(reversed_words, word_list[i])
   end
 
-  -- Calculate position in reversed word order.
-  local reversed_word_idx = #words - cursor_word_idx + 1
-  local visual_pos = 0
-
-  for i = 1, reversed_word_idx - 1 do
-    local orig_idx = #words - i + 1
-    visual_pos = visual_pos + #words[orig_idx].word + 1  -- +1 for space.
+  -- Reverse space order too (space between word 1-2 maps to space between last two words).
+  local reversed_spaces = {}
+  for i = #space_list, 1, -1 do
+    table.insert(reversed_spaces, space_list[i])
   end
 
-  -- +1 because visual_pos points to end of preceding content (including space).
-  return visual_pos + offset_in_word + 1
+  -- Rebuild with spaces between words (same order as visual_text).
+  local visual_chars = {}
+  for i, w in ipairs(reversed_words) do
+    for _, c in ipairs(w.chars) do
+      table.insert(visual_chars, c)
+    end
+    -- Add space after each word except the last, using reversed original spaces.
+    if i < #reversed_words and reversed_spaces[i] then
+      table.insert(visual_chars, reversed_spaces[i])
+    end
+  end
+
+  -- Build mapping from original char index to visual byte position.
+  -- Within each word, mirror the position (first char maps to last position, etc.)
+  -- so the highlight moves in the opposite direction from the cursor.
+  local orig_to_visual = {}
+  local visual_byte = 1
+
+  for i, w in ipairs(reversed_words) do
+    local word_len = #w.chars
+    -- Calculate byte positions for each character in this word.
+    local char_positions = {}
+    local pos = visual_byte
+    for _, c in ipairs(w.chars) do
+      table.insert(char_positions, pos)
+      pos = pos + #c.char
+    end
+
+    -- Map each character to its mirror position within the word.
+    for j, c in ipairs(w.chars) do
+      local mirror_j = word_len - j + 1
+      orig_to_visual[c.orig_idx] = char_positions[mirror_j]
+    end
+
+    visual_byte = pos
+
+    -- Map space after word.
+    if i < #reversed_words and reversed_spaces[i] then
+      orig_to_visual[reversed_spaces[i].orig_idx] = visual_byte
+      visual_byte = visual_byte + #reversed_spaces[i].char
+    end
+  end
+
+  -- Build mapping from original byte position to visual byte position.
+  local byte_map = {}
+  for i, c in ipairs(chars) do
+    local visual_pos = orig_to_visual[i]
+    if visual_pos then
+      -- Map each byte of this character.
+      for b = 0, #c.char - 1 do
+        byte_map[c.start + b] = visual_pos + b
+      end
+    end
+  end
+
+  return byte_map
+end
+
+--- Map cursor position from logical to visual order.
+--- Returns the byte offset in the visual text, or nil if not mappable.
+local function map_cursor_to_visual(text, cursor_offset)
+  if cursor_offset < 1 or cursor_offset > #text then
+    return nil
+  end
+
+  local byte_map = build_position_map(text)
+  return byte_map[cursor_offset]
 end
 
 --- Update the hint for the current cursor position.
@@ -301,9 +466,15 @@ local function update_hint()
       current_col = screen_col - 1
     end
 
-    -- Reverse word order.
-    local visual_text = reverse_words(run.text)
-    if visual_text ~= run.text then
+    -- Replace ZWNJ with dotted circle first (if workaround enabled).
+    local run_text = run.text
+    if M.config.zwnj_workaround then
+      run_text = run_text:gsub(ZWNJ, DOTTED_CIRCLE)
+    end
+
+    -- Convert to visual order.
+    local visual_text = to_visual_order(run_text)
+    if visual_text ~= run_text then
       any_different = true
     end
 
@@ -313,7 +484,7 @@ local function update_hint()
 
     if cursor_in_run then
       local cursor_offset = cursor_col - run.start_byte + 1
-      visual_cursor_pos = map_cursor_to_visual(run.text, cursor_offset)
+      visual_cursor_pos = map_cursor_to_visual(run_text, cursor_offset)
     end
 
     -- Add the text, highlighting cursor position if applicable.
@@ -392,7 +563,7 @@ local function setup_native_motions(buf)
   end
 end
 
---- Check if plugin is available (always true, no external deps).
+--- Check if plugin is available (always true).
 function M.available()
   return true
 end
@@ -414,7 +585,7 @@ end
 
 function M.check()
   vim.health.start('bidi-scope.nvim')
-  vim.health.ok('bidi-scope.nvim loaded (no external dependencies)')
+  vim.health.ok('bidi-scope.nvim loaded')
 end
 
 function M.setup(opts)
@@ -427,20 +598,20 @@ function M.setup(opts)
 
   local aug = vim.api.nvim_create_augroup('bidi_scope', { clear = true })
 
-  -- Update hint on cursor movement.
-  vim.api.nvim_create_autocmd('CursorMoved', {
+  -- Update hint on cursor movement and text changes.
+  vim.api.nvim_create_autocmd({
+    'CursorMoved',
+    'CursorMovedI',
+    'TextChanged',
+    'TextChangedI',
+    'InsertLeave',
+  }, {
     group = aug,
     callback = update_hint,
   })
 
-  -- Clear hint when leaving buffer or on certain events.
-  vim.api.nvim_create_autocmd({ 'BufLeave', 'InsertEnter' }, {
-    group = aug,
-    callback = clear_hint,
-  })
-
-  -- Clear hint when text changes (it may invalidate the cached run).
-  vim.api.nvim_create_autocmd('TextChanged', {
+  -- Clear hint when leaving buffer.
+  vim.api.nvim_create_autocmd('BufLeave', {
     group = aug,
     callback = clear_hint,
   })

@@ -56,6 +56,7 @@ require('bidi-scope').setup({
   suppress_identical = false, -- Hide hint if visual = logical (default: false)
   fix_iskeyword = true,       -- Add RTL ranges to iskeyword (default: true)
   native_motions = true,      -- Use native motions in RTL buffers (default: true)
+  zwnj_workaround = false,    -- Workaround for kitty terminal ZWNJ bug (default: false)
 })
 ```
 
@@ -72,6 +73,10 @@ in which case see the next option.
 **native_motions**: When `true`, buffers containing RTL text automatically get
 buffer-local word motion mappings (`w`, `b`, `e`, `ge`) that use native Vim
 motions with proper `iskeyword` settings for RTL characters.
+
+**zwnj_workaround**: When `true`, replaces ZWNJ (zero-width non-joiner) with a
+dotted circle (◌) in hints. Enable this if Persian/Arabic compound words appear
+garbled in terminals that don't handle ZWNJ correctly.
 
 ## Compatibility
 
@@ -94,6 +99,18 @@ settings.
 3. Reverses word order within each run for visual display.
 4. Shows hints as virtual lines below the text using extmarks.
 5. Maps cursor position from logical to visual order.
+
+**Note**: Display of ZWNJ (zero-width non-joiner) and similar characters depends
+on your terminal's bidi support. Some terminals may not render these correctly
+in the hint line.
+
+## Known Limitations
+
+**ZWNJ deletion behaviour**: When the cursor is on a character immediately before
+a ZWNJ, Neovim's `x` command deletes both the character and the ZWNJ together.
+The hint line highlight only shows the visible character, not the ZWNJ position.
+With `zwnj_workaround` enabled, the ZWNJ appears as a dotted circle (◌) in the
+hint but may not be highlighted along with the adjacent character.
 
 ## License
 
