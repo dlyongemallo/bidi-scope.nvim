@@ -9,7 +9,8 @@ M.config = {
   suppress_identical = false,  -- Hide hint if visual order matches logical order.
   fix_iskeyword = true,        -- Add RTL character ranges to iskeyword (may be overridden by movement plugins).
   native_motions = true,       -- Use native word motions in buffers with RTL content (for nvim-spider compat).
-  zwnj_workaround = false,     -- Replace ZWNJ with dotted circle (workaround for kitty).
+  replace_zwnj = false,        -- Replace ZWNJ with dotted circle.
+  swap_zwnj_parts = false,     -- Swap parts of a word around a ZWNJ (at most one per word).
 }
 
 -- Namespace for extmarks.
@@ -29,18 +30,67 @@ local ZWNJ = vim.fn.nr2char(0x200C)
 -- Dotted circle (U+25CC) - visible marker for ZWNJ position.
 local DOTTED_CIRCLE = vim.fn.nr2char(0x25CC)
 
---- Reverse word order for visual display.
+--- Swap parts of a word around a ZWNJ.
+--- Only handles at most one ZWNJ per word.
+local function swap_zwnj_word(word)
+  local pos = word:find(ZWNJ, 1, true)
+  if not pos then
+    return word
+  end
+  local before = word:sub(1, pos - 1)
+  local after = word:sub(pos + #ZWNJ)
+  return after .. ZWNJ .. before
+end
+
+--- Reverse word order for visual display, preserving original whitespace.
 local function reverse_words(text)
   local words = {}
-  for word in text:gmatch('%S+') do
-    table.insert(words, 1, word)  -- Insert at front to reverse.
+  local gaps = {}
+  local pos = 1
+  local len = #text
+  while pos <= len do
+    -- Match whitespace gap.
+    local gap_start = pos
+    while pos <= len and text:sub(pos, pos):match('%s') do
+      pos = pos + 1
+    end
+    if pos > gap_start then
+      table.insert(gaps, text:sub(gap_start, pos - 1))
+    end
+    -- Match word.
+    local word_start = pos
+    while pos <= len and not text:sub(pos, pos):match('%s') do
+      pos = pos + 1
+    end
+    if pos > word_start then
+      table.insert(words, text:sub(word_start, pos - 1))
+    end
   end
-  return table.concat(words, ' ')
+  -- Reverse both words and gaps.
+  local parts = {}
+  for i = #words, 1, -1 do
+    parts[#parts + 1] = words[i]
+    if i > 1 then
+      local gap_idx = #gaps - (#words - i)
+      parts[#parts + 1] = (gap_idx >= 1 and gaps[gap_idx]) or ' '
+    end
+  end
+  return table.concat(parts)
 end
 
 --- Convert text to visual order for hint display.
+--- Applies ZWNJ workarounds (swap/replace) before reversing word order.
 local function to_visual_order(text)
-  return reverse_words(text)
+  local result = text
+  if M.config.swap_zwnj_parts then
+    result = result:gsub('%S+', function(word)
+      return swap_zwnj_word(word)
+    end)
+  end
+  if M.config.replace_zwnj then
+    result = result:gsub(ZWNJ, DOTTED_CIRCLE)
+  end
+  return reverse_words(result)
 end
 
 --- Get the Unicode codepoint of a UTF-8 character.
@@ -142,14 +192,49 @@ local function is_rtl(cp)
 end
 
 --- Check if a buffer contains any RTL characters (first 100 lines only).
+--- Uses a direct byte scan to avoid table allocations.
 local function buffer_has_rtl(buf)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, 100, false)
   for _, line in ipairs(lines) do
-    local chars = utf8_chars(line)
-    for _, c in ipairs(chars) do
-      local cp = utf8_codepoint(c.char)
-      if is_rtl(cp) then
-        return true
+    local len = #line
+    local i = 1
+    while i <= len do
+      local b = line:byte(i)
+      if b < 0x80 then
+        -- ASCII: skip.
+        i = i + 1
+      elseif b >= 0xC2 and b <= 0xDF then
+        -- 2-byte sequence. RTL starts at U+0590 (0xD6 0x90).
+        if b >= 0xD6 then
+          local b2 = line:byte(i + 1)
+          if b2 then
+            local cp = (b - 0xC0) * 64 + (b2 - 0x80)
+            if is_rtl(cp) then return true end
+          end
+        end
+        i = i + 2
+      elseif b >= 0xE0 and b <= 0xEF then
+        -- 3-byte sequence. Only certain leading bytes can encode BMP RTL codepoints.
+        if b == 0xE0 or b == 0xE2 or b == 0xEF then
+          local b2, b3 = line:byte(i + 1), line:byte(i + 2)
+          if b2 and b3 then
+            local cp = (b - 0xE0) * 4096 + (b2 - 0x80) * 64 + (b3 - 0x80)
+            if is_rtl(cp) then return true end
+          end
+        end
+        i = i + 3
+      elseif b >= 0xF0 and b <= 0xF7 then
+        -- 4-byte sequence (SMP, rare in practice).
+        local b2, b3, b4 = line:byte(i + 1), line:byte(i + 2), line:byte(i + 3)
+        if b2 and b3 and b4 then
+          local cp = (b - 0xF0) * 262144 + (b2 - 0x80) * 4096
+                   + (b3 - 0x80) * 64 + (b4 - 0x80)
+          if is_rtl(cp) then return true end
+        end
+        i = i + 4
+      else
+        -- Continuation or invalid byte: skip.
+        i = i + 1
       end
     end
   end
@@ -308,94 +393,122 @@ local function build_position_map(text)
     return {}
   end
 
-  -- Group characters into words, tracking char indices.
-  local words = {}
-  local current_word = { chars = {}, start_char = nil }
+  -- Group characters into words and inter-word gap segments.
+  local word_list = {}
+  local gap_list = {}
+  local current_word = { chars = {} }
+  local current_gap = {}
 
   for i, c in ipairs(chars) do
-    local is_space = c.char:match('^%s+$')
-    if is_space then
+    if c.char:match('^%s$') then
       if #current_word.chars > 0 then
-        table.insert(words, current_word)
-        current_word = { chars = {}, start_char = nil }
+        table.insert(word_list, current_word)
+        current_word = { chars = {} }
       end
-      -- Space characters go into their own "word" to preserve them.
-      table.insert(words, { chars = { { char = c.char, orig_idx = i } }, is_space = true })
+      table.insert(current_gap, { char = c.char, orig_idx = i })
     else
-      if current_word.start_char == nil then
-        current_word.start_char = i
+      if #current_gap > 0 then
+        table.insert(gap_list, current_gap)
+        current_gap = {}
       end
       table.insert(current_word.chars, { char = c.char, orig_idx = i })
     end
   end
   if #current_word.chars > 0 then
-    table.insert(words, current_word)
+    table.insert(word_list, current_word)
   end
 
-  -- Separate words and spaces, then reverse only the words.
-  local word_list = {}
-  local space_list = {}
-
-  for _, w in ipairs(words) do
-    if w.is_space then
-      table.insert(space_list, w.chars[1])  -- Store the space char with orig_idx.
-    else
-      table.insert(word_list, w)
-    end
-  end
-
-  -- Reverse word order.
+  -- Reverse word order and gap order.
   local reversed_words = {}
   for i = #word_list, 1, -1 do
     table.insert(reversed_words, word_list[i])
   end
-
-  -- Reverse space order too (space between word 1-2 maps to space between last two words).
-  local reversed_spaces = {}
-  for i = #space_list, 1, -1 do
-    table.insert(reversed_spaces, space_list[i])
-  end
-
-  -- Rebuild with spaces between words (same order as visual_text).
-  local visual_chars = {}
-  for i, w in ipairs(reversed_words) do
-    for _, c in ipairs(w.chars) do
-      table.insert(visual_chars, c)
-    end
-    -- Add space after each word except the last, using reversed original spaces.
-    if i < #reversed_words and reversed_spaces[i] then
-      table.insert(visual_chars, reversed_spaces[i])
-    end
+  local reversed_gaps = {}
+  for i = #gap_list, 1, -1 do
+    table.insert(reversed_gaps, gap_list[i])
   end
 
   -- Build mapping from original char index to visual byte position.
-  -- Within each word, mirror the position (first char maps to last position, etc.)
+  -- Within each word (or each half of a ZWNJ-split word), mirror the position
   -- so the highlight moves in the opposite direction from the cursor.
   local orig_to_visual = {}
   local visual_byte = 1
 
   for i, w in ipairs(reversed_words) do
-    local word_len = #w.chars
-    -- Calculate byte positions for each character in this word.
-    local char_positions = {}
-    local pos = visual_byte
-    for _, c in ipairs(w.chars) do
-      table.insert(char_positions, pos)
-      pos = pos + #c.char
+    local word_chars = w.chars
+
+    -- Check for ZWNJ swap: find the ZWNJ boundary within this word.
+    local zwnj_idx = nil
+    if M.config.swap_zwnj_parts then
+      for k, c in ipairs(word_chars) do
+        if c.char == ZWNJ then
+          zwnj_idx = k
+          break
+        end
+      end
     end
 
-    -- Map each character to its mirror position within the word.
-    for j, c in ipairs(w.chars) do
-      local mirror_j = word_len - j + 1
-      orig_to_visual[c.orig_idx] = char_positions[mirror_j]
+    if zwnj_idx then
+      -- ZWNJ swap active: lay out bytes as [after, ZWNJ, before] and
+      -- mirror within each half independently.
+      local before = {}
+      for k = 1, zwnj_idx - 1 do
+        table.insert(before, word_chars[k])
+      end
+      local zwnj_char = word_chars[zwnj_idx]
+      local after = {}
+      for k = zwnj_idx + 1, #word_chars do
+        table.insert(after, word_chars[k])
+      end
+
+      -- Compute byte positions in swapped layout: [after][ZWNJ][before].
+      local pos = visual_byte
+      local after_positions = {}
+      for _, c in ipairs(after) do
+        table.insert(after_positions, pos)
+        pos = pos + #c.char
+      end
+      local zwnj_pos = pos
+      pos = pos + #zwnj_char.char
+      local before_positions = {}
+      for _, c in ipairs(before) do
+        table.insert(before_positions, pos)
+        pos = pos + #c.char
+      end
+
+      -- Mirror within the after part.
+      for j, c in ipairs(after) do
+        orig_to_visual[c.orig_idx] = after_positions[#after - j + 1]
+      end
+      -- ZWNJ maps to its own position.
+      orig_to_visual[zwnj_char.orig_idx] = zwnj_pos
+      -- Mirror within the before part.
+      for j, c in ipairs(before) do
+        orig_to_visual[c.orig_idx] = before_positions[#before - j + 1]
+      end
+
+      visual_byte = pos
+    else
+      -- No ZWNJ split: full-word mirror.
+      local word_len = #word_chars
+      local char_positions = {}
+      local pos = visual_byte
+      for _, c in ipairs(word_chars) do
+        table.insert(char_positions, pos)
+        pos = pos + #c.char
+      end
+      for j, c in ipairs(word_chars) do
+        orig_to_visual[c.orig_idx] = char_positions[word_len - j + 1]
+      end
+      visual_byte = pos
     end
 
-    visual_byte = pos
-
-    -- Map space after word.
-    if i < #reversed_words and reversed_spaces[i] then
-      orig_to_visual[reversed_spaces[i].orig_idx] = visual_byte
-      visual_byte = visual_byte + #reversed_spaces[i].char
+    -- Map inter-word gap.
+    if i < #reversed_words and reversed_gaps[i] then
+      for _, gc in ipairs(reversed_gaps[i]) do
+        orig_to_visual[gc.orig_idx] = visual_byte
+        visual_byte = visual_byte + #gc.char
+      end
     end
   end
 
@@ -466,15 +579,9 @@ local function update_hint()
       current_col = screen_col - 1
     end
 
-    -- Replace ZWNJ with dotted circle first (if workaround enabled).
-    local run_text = run.text
-    if M.config.zwnj_workaround then
-      run_text = run_text:gsub(ZWNJ, DOTTED_CIRCLE)
-    end
-
-    -- Convert to visual order.
-    local visual_text = to_visual_order(run_text)
-    if visual_text ~= run_text then
+    -- Convert to visual order (includes ZWNJ workarounds).
+    local visual_text = to_visual_order(run.text)
+    if visual_text ~= run.text then
       any_different = true
     end
 
@@ -484,7 +591,7 @@ local function update_hint()
 
     if cursor_in_run then
       local cursor_offset = cursor_col - run.start_byte + 1
-      visual_cursor_pos = map_cursor_to_visual(run_text, cursor_offset)
+      visual_cursor_pos = map_cursor_to_visual(run.text, cursor_offset)
     end
 
     -- Add the text, highlighting cursor position if applicable.
@@ -586,6 +693,40 @@ end
 function M.check()
   vim.health.start('bidi-scope.nvim')
   vim.health.ok('bidi-scope.nvim loaded')
+
+  -- Check iskeyword ranges.
+  local iskw = vim.o.iskeyword
+  local has_hebrew = iskw:find('1424%-1535') ~= nil
+  local has_arabic = iskw:find('1536%-1791') ~= nil
+  if M.config.fix_iskeyword then
+    if has_hebrew and has_arabic then
+      vim.health.ok('iskeyword contains RTL ranges (1424-1535, 1536-1791)')
+    else
+      vim.health.warn('iskeyword missing RTL ranges; fix_iskeyword is enabled but ranges not yet applied')
+    end
+  else
+    vim.health.info('fix_iskeyword is disabled by config')
+  end
+
+  -- Check native_motions keymaps.
+  if M.config.native_motions then
+    local buf = vim.api.nvim_get_current_buf()
+    local maps = vim.api.nvim_buf_get_keymap(buf, 'n')
+    local found = false
+    for _, map in ipairs(maps) do
+      if map.desc and map.desc:find('bidi%-scope') then
+        found = true
+        break
+      end
+    end
+    if found then
+      vim.health.ok('native_motions keymaps found in current buffer')
+    else
+      vim.health.info('native_motions keymaps not found in current buffer (expected if no RTL content)')
+    end
+  else
+    vim.health.info('native_motions is disabled by config')
+  end
 end
 
 function M.setup(opts)
