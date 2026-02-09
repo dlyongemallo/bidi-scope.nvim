@@ -56,7 +56,8 @@ require('bidi-scope').setup({
   suppress_identical = false, -- Hide hint if visual = logical (default: false)
   fix_iskeyword = true,       -- Add RTL ranges to iskeyword (default: true)
   native_motions = true,      -- Use native motions in RTL buffers (default: true)
-  zwnj_workaround = false,    -- Workaround for kitty terminal ZWNJ bug (default: false)
+  replace_zwnj = false,       -- Replace ZWNJ with dotted circle (default: false)
+  swap_zwnj_parts = false,    -- Swap parts of a word around ZWNJ (default: false)
 })
 ```
 
@@ -74,9 +75,13 @@ in which case see the next option.
 buffer-local word motion mappings (`w`, `b`, `e`, `ge`) that use native Vim
 motions with proper `iskeyword` settings for RTL characters.
 
-**zwnj_workaround**: When `true`, replaces ZWNJ (zero-width non-joiner) with a
+**replace_zwnj**: When `true`, replaces ZWNJ (zero-width non-joiner) with a
 dotted circle (◌) in hints. Enable this if Persian/Arabic compound words appear
 garbled in terminals that don't handle ZWNJ correctly.
+
+**swap_zwnj_parts**: When `true`, swaps the two parts of a word around a ZWNJ
+in hints. This can fix display on terminals where `replace_zwnj` alone doesn't
+produce correct results. Only works if there is at most one ZWNJ per word.
 
 ## Compatibility
 
@@ -109,7 +114,7 @@ in the hint line.
 **ZWNJ deletion behaviour**: When the cursor is on a character immediately before
 a ZWNJ, Neovim's `x` command deletes both the character and the ZWNJ together.
 The hint line highlight only shows the visible character, not the ZWNJ position.
-With `zwnj_workaround` enabled, the ZWNJ appears as a dotted circle (◌) in the
+With `replace_zwnj` enabled, the ZWNJ appears as a dotted circle (◌) in the
 hint but may not be highlighted along with the adjacent character.
 
 ## License
